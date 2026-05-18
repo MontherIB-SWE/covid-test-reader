@@ -22,7 +22,7 @@ data/labeled/
 data/unlabeled/
 data/autolabel/
 data/assets/
-
+to_submit/
 # Outputs (build artifacts)
 outputs/
 
