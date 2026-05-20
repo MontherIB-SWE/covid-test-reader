@@ -89,7 +89,7 @@ class _EditorCanvas(QFrame):
         super().__init__()
         self._owner = owner
         self.setMinimumSize(400, 320)
-        self.setStyleSheet(f"background:{BG_CARD}; border:1px solid {BORDER};")
+        self.setObjectName("editorCanvas")
         self.setMouseTracking(True)
 
     def paintEvent(self, _event) -> None:
@@ -140,6 +140,7 @@ class _EditorCanvas(QFrame):
 
 class RelabelWidget(QWidget):
     status_changed = Signal(str)
+    label_saved = Signal(str)  # emits image stem when label is written
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -205,7 +206,7 @@ class RelabelWidget(QWidget):
         lr = QHBoxLayout(labels_row)
         lr.setContentsMargins(0, 0, 0, 0)
         self._labels_dir_lbl = QLabel(f"Labels: {self.labels_root}")
-        self._labels_dir_lbl.setStyleSheet(f"color:{FG_DIM}; font-family:{MONO}; font-size:9pt;")
+        self._labels_dir_lbl.setObjectName("pathLabel")
         self._labels_dir_lbl.setWordWrap(True)
         lr.addWidget(self._labels_dir_lbl, 1)
         root.addWidget(toolbar_panel(row1, labels_row))
@@ -223,7 +224,6 @@ class RelabelWidget(QWidget):
         list_col.addLayout(self._hdr_row("POIs", ACCENT))
         self._poi_list = QListWidget()
         self._poi_list.setMaximumWidth(220)
-        self._poi_list.setStyleSheet(f"background:{BG_PANEL};")
         self._poi_list.itemClicked.connect(self._on_poi_list_click)
         list_col.addWidget(self._poi_list, 1)
         prev_col = QVBoxLayout()
@@ -231,7 +231,7 @@ class RelabelWidget(QWidget):
         self._preview = QLabel()
         self._preview.setMinimumSize(200, 200)
         self._preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._preview.setStyleSheet(f"background:{BG_CARD}; border:1px solid {BORDER};")
+        self._preview.setObjectName("editorCanvas")
         prev_col.addWidget(self._preview, 1)
         mid.addLayout(left_col, 4)
         mid.addLayout(list_col, 0)
@@ -241,12 +241,12 @@ class RelabelWidget(QWidget):
         self._status = QLabel()
         self._status.setObjectName("statusLabel")
         self._dirty_lbl = QLabel("")
-        self._dirty_lbl.setStyleSheet(f"color:{ORANGE}; font-weight:bold;")
+        self._dirty_lbl.setObjectName("dirtyLabel")
         st.addWidget(self._status, 1)
         st.addWidget(self._dirty_lbl)
         sb = QWidget()
         sb.setLayout(st)
-        sb.setStyleSheet(f"background:{BG_PANEL};")
+        sb.setObjectName("bottomStatusBar")
         root.addWidget(sb)
 
     @staticmethod
@@ -451,6 +451,7 @@ class RelabelWidget(QWidget):
             label_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         elif label_path.exists():
             label_path.unlink()
+        self.label_saved.emit(image_path.stem)
 
     def save_all(self) -> None:
         self._mark_dirty()

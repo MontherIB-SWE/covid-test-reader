@@ -20,6 +20,12 @@ DATA_GENERATED_DIR = DATA_DIR / "generated"        # synthetic composites
 DATA_ASSETS_DIR = DATA_DIR / "assets"              # extracted POI crops (PNG)
 DATA_AUTOLABEL_DIR = DATA_DIR / "autolabel"        # auto-captured frames
 DATA_UNLABELED_DIR = DATA_DIR / "unlabeled"       # POI images not yet labeled
+DATA_RESULT_CLS_DIR = DATA_DIR / "result_cls"     # result classification data
+RESULT_CLS_MANIFEST = DATA_RESULT_CLS_DIR / "manifest.csv"
+RESULT_CLS_CROPS_DIR = DATA_RESULT_CLS_DIR / "crops"
+RESULT_CLS_AUGMENTED_DIR = DATA_RESULT_CLS_DIR / "augmented"
+RESULT_CLS_AUGMENT_INDEX = DATA_RESULT_CLS_DIR / "augmented_index.json"
+RESULT_CLS_AUG_PER_STEM = 12
 
 # Outputs — build artifacts, configs, training bundles
 OUTPUTS_DIR = Path("outputs")
@@ -27,12 +33,17 @@ TRAIN_SOURCES_JSON = OUTPUTS_DIR / "train_sources.json"
 TRAIN_BUNDLE_DIR = OUTPUTS_DIR / "train_bundle"
 TRAIN_DATA_YAML = OUTPUTS_DIR / "train_data.yaml"
 DATASET_PATHS_JSON = OUTPUTS_DIR / "dataset_paths.json"
+RESULT_CLS_BUNDLE_DIR = OUTPUTS_DIR / "result_cls_bundle"
 
 # Training runs — YOLO writes weights here
 RUNS_DIR = Path("runs")
 
 # Default model — searched first; resolve_model_path() finds the latest
 DEFAULT_MODEL_PATH = RUNS_DIR / "poi_train_exp" / "weights" / "best.pt"
+
+# Result classifier (ResNet-50)
+RESULT_CLS_RUNS_DIR = RUNS_DIR / "result_cls"
+RESULT_CLS_ARCH = "resnet50"
 
 # ── Training defaults ──────────────────────────────────────────────────────
 DEFAULT_LR = 0.002
@@ -73,27 +84,27 @@ POI_COLORS_HEX = [_bgr_to_hex(c) for c in POI_COLORS_BGR]
 DRAG_RADIUS = 8
 
 # ── Theme ──────────────────────────────────────────────────────────────────
-BG = "#0f0f0f"
-BG_PANEL = "#1a1a1a"
-BG_CARD = "#222222"
-BG_INPUT = "#2a2a2a"
-BG_HOVER = "#333333"
-BG_ACTIVE = "#3a3a3a"
-FG = "#e0e0e0"
-FG_DIM = "#888888"
+BG = "#090a0f"
+BG_PANEL = "#11131e"
+BG_CARD = "#171a27"
+BG_INPUT = "#1f2336"
+BG_HOVER = "#282c44"
+BG_ACTIVE = "#303652"
+FG = "#f8fafc"
+FG_DIM = "#94a3b8"
 FG_SEL = "#ffffff"
-ACCENT = "#00a86b"
-ACCENT_HOVER = "#00c07e"
-ORANGE = "#e0952a"
-ORANGE_HOVER = "#f0a83e"
-RED = "#e04040"
-RED_HOVER = "#f05050"
-YELLOW = "#e0c040"
-CYAN = "#40c0e0"
-BORDER = "#333333"
-SEP = "#2a2a2a"
-FONT = "Segoe UI"
-MONO = "Consolas"
+ACCENT = "#6366f1"
+ACCENT_HOVER = "#4f46e5"
+ORANGE = "#f59e0b"
+ORANGE_HOVER = "#d97706"
+RED = "#ef4444"
+RED_HOVER = "#dc2626"
+YELLOW = "#eab308"
+CYAN = "#06b6d4"
+BORDER = "#25293d"
+SEP = "#1e2235"
+FONT = "Inter, Segoe UI, system-ui, sans-serif"
+MONO = "Consolas, Fira Code, monospace"
 
 # ── Win32 bindings ─────────────────────────────────────────────────────────
 _SetWindowDisplayAffinity = None
@@ -172,3 +183,17 @@ def resolve_model_path() -> Path | None:
             unique.append(p)
 
     return max(unique, key=lambda p: p.stat().st_mtime)
+
+
+def resolve_result_cls_model_path() -> Path | None:
+    """Find the most recent ResNet-34 result classifier checkpoint."""
+    if not RESULT_CLS_RUNS_DIR.is_dir():
+        return None
+    candidates: list[Path] = []
+    try:
+        candidates.extend(RESULT_CLS_RUNS_DIR.rglob("best.pt"))
+    except OSError:
+        pass
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.stat().st_mtime)

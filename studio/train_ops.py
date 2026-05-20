@@ -1,6 +1,9 @@
 """Training dataset bundle preparation (no UI). Used by studio.qt.train_tab."""
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 import random
 import shutil
 from pathlib import Path
@@ -14,6 +17,7 @@ from studio.config import (
 
 _VAL_FRACTION = 0.15
 _BUNDLE_SEED = 42
+_FINGERPRINT_FILE = TRAIN_BUNDLE_DIR / ".fingerprint"
 
 
 def train_device() -> int | str:
@@ -22,6 +26,58 @@ def train_device() -> int | str:
         return 0 if torch.cuda.is_available() else "cpu"
     except ImportError:
         return "cpu"
+
+
+# ── Fingerprint cache ──────────────────────────────────────────────────────
+# Avoids the expensive rmtree + re-link cycle (~26 k filesystem ops) when
+# the source data hasn't changed between training runs.
+
+def _dir_fingerprint(d: Path | None) -> str:
+    """Return 'count:total_bytes' for a directory, or '' if None/missing."""
+    if d is None or not d.is_dir():
+        return ""
+    count = 0
+    total = 0
+    for p in d.rglob("*"):
+        if p.is_file():
+            count += 1
+            total += p.stat().st_size
+    return f"{count}:{total}"
+
+
+def _compute_fingerprint(key_parts: list[str]) -> str:
+    raw = "\n".join(key_parts)
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _read_cached_fingerprint() -> tuple[str, int, int] | None:
+    """Return (fingerprint, n_train, n_val) or None."""
+    try:
+        data = json.loads(_FINGERPRINT_FILE.read_text(encoding="utf-8"))
+        return data["fp"], data["n_train"], data["n_val"]
+    except Exception:
+        return None
+
+
+def _write_fingerprint(fp: str, n_train: int, n_val: int,
+                       summary: str = "") -> None:
+    _FINGERPRINT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _FINGERPRINT_FILE.write_text(
+        json.dumps({"fp": fp, "n_train": n_train, "n_val": n_val,
+                     "summary": summary}),
+        encoding="utf-8",
+    )
+
+
+def _bundle_looks_valid() -> bool:
+    """Quick sanity: the four split dirs exist and have files."""
+    for sub in ("images/train", "images/val", "labels/train", "labels/val"):
+        d = TRAIN_BUNDLE_DIR / sub
+        if not d.is_dir():
+            return False
+        if not any(d.iterdir()):
+            return False
+    return TRAIN_DATA_YAML.is_file()
 
 
 def _collect_pairs_for_source(images_dir: Path, labels_dir: Path) -> list[tuple[Path, Path]]:
@@ -126,16 +182,24 @@ def _reset_bundle_dirs() -> tuple[Path, Path, Path, Path]:
     return train_img, train_lbl, val_img, val_lbl
 
 
+def _fast_link(src: Path, dst: Path) -> None:
+    """Hard-link *src* → *dst* (instant on NTFS), fall back to copy."""
+    try:
+        os.link(src, dst)
+    except OSError:
+        shutil.copy2(src, dst)
+
+
 def _copy_bundle_rows(rows: list[BundleRow], img_dir: Path, lbl_dir: Path) -> None:
     for idx, (img_p, lab_p, si) in enumerate(rows):
         stem = f"src{si:02d}_{idx:05d}_{img_p.stem}"[:180]
         dst_i = img_dir / f"{stem}{img_p.suffix}"
         dst_l = lbl_dir / f"{stem}.txt"
-        shutil.copy2(img_p, dst_i)
+        _fast_link(img_p, dst_i)
         if lab_p is None:
             dst_l.write_text("", encoding="utf-8")
         else:
-            shutil.copy2(lab_p, dst_l)
+            _fast_link(lab_p, dst_l)
 
 
 def _write_data_yaml() -> None:
@@ -163,6 +227,22 @@ def prepare_mixed_train_bundle(
     if not (0 < labeled_fraction <= 1.0):
         raise ValueError("Labeled fraction must be between 0 and 100% (e.g. 20 for 20% POI images).")
 
+    # ── Fingerprint check: skip rebuild if data is unchanged ───────────
+    fp_parts = [
+        "mix",
+        str(generated_root), _dir_fingerprint(generated_root),
+        str(labeled_poi_root), _dir_fingerprint(labeled_poi_root),
+        str(negatives_root), _dir_fingerprint(negatives_root),
+        str(labeled_fraction), str(val_fraction), str(seed),
+    ]
+    fp = _compute_fingerprint(fp_parts)
+    cached = _read_cached_fingerprint()
+    if cached and cached[0] == fp and _bundle_looks_valid():
+        n_tr, n_val = cached[1], cached[2]
+        summary = f"(cached bundle) Train {n_tr} / val {n_val}."
+        return TRAIN_DATA_YAML.resolve(), n_tr, n_val, summary
+
+    # ── Full rebuild ───────────────────────────────────────────────────
     tagged: list[tuple[Path, Path, int]] = []
     tagged.extend(_collect_positive_pairs_tagged(generated_root, 0))
     tagged.extend(_collect_positive_pairs_tagged(labeled_poi_root, 1))
@@ -226,6 +306,7 @@ def prepare_mixed_train_bundle(
     if len(neg_chosen) < n_neg_needed:
         summary += " Not enough negatives for exact ratio — used all available."
 
+    _write_fingerprint(fp, len(train_bundle), len(val_bundle), summary)
     return TRAIN_DATA_YAML.resolve(), len(train_bundle), len(val_bundle), summary
 
 
@@ -235,6 +316,18 @@ def prepare_train_bundle(
     val_fraction: float = _VAL_FRACTION,
     seed: int = _BUNDLE_SEED,
 ) -> tuple[Path, int, int]:
+    # ── Fingerprint check ──────────────────────────────────────────────
+    fp_parts = ["manual"]
+    for img_d, lbl_d in sources:
+        fp_parts += [str(img_d), _dir_fingerprint(img_d),
+                     str(lbl_d), _dir_fingerprint(lbl_d)]
+    fp_parts += [str(val_fraction), str(seed)]
+    fp = _compute_fingerprint(fp_parts)
+    cached = _read_cached_fingerprint()
+    if cached and cached[0] == fp and _bundle_looks_valid():
+        return TRAIN_DATA_YAML.resolve(), cached[1], cached[2]
+
+    # ── Full rebuild ───────────────────────────────────────────────────
     all_rows: list[tuple[Path, Path, int]] = []
     for si, (img_d, lbl_d) in enumerate(sources):
         for img_p, lab_p in _collect_pairs_for_source(img_d, lbl_d):
@@ -264,6 +357,7 @@ def prepare_train_bundle(
     _copy_bundle_rows(val_rows, val_img, val_lbl)
     _write_data_yaml()
 
+    _write_fingerprint(fp, len(train_rows), len(val_rows))
     return TRAIN_DATA_YAML.resolve(), len(train_rows), len(val_rows)
 
 

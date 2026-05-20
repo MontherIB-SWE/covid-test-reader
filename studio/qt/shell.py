@@ -42,7 +42,7 @@ class PoiStudioWindow(QWidget):
         root.setSpacing(0)
 
         tab_bar = QWidget()
-        tab_bar.setStyleSheet(f"background:{BG_PANEL};")
+        tab_bar.setObjectName("topTabBar")
         tb_lay = QHBoxLayout(tab_bar)
         tb_lay.setContentsMargins(8, 6, 8, 6)
         tb_lay.setAlignment(Qt.AlignmentFlag.AlignVCenter)
@@ -199,6 +199,10 @@ class PoiStudioWindow(QWidget):
     def load_trained_model(self, path: str) -> None:
         self._switch_tab(0)
         self.viewer.load_trained_model(path)
+
+    def load_result_classifier(self, path: str) -> None:
+        self._switch_tab(0)
+        self.viewer.load_result_classifier(path)
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self.viewer.close_cleanup()

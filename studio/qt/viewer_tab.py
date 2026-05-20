@@ -13,6 +13,7 @@ import numpy as np
 from PIL import Image, ImageGrab
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QFileDialog,
     QGridLayout,
@@ -28,6 +29,9 @@ from PySide6.QtWidgets import (
 from ultralytics import YOLO
 
 from studio.config import (
+    ACCENT,
+    BG_INPUT,
+    BG_PANEL,
     AUTOLABEL_MIN_INTERVAL,
     CAM_DISCONNECT_THRESHOLD,
     DATA_AUTOLABEL_DIR,
@@ -42,6 +46,7 @@ from studio.config import (
     _select_device,
     resolve_model_path,
 )
+from studio.crop_ops import order_quad_points, warp_quad_crop
 from studio.qt.images import numpy_bgr_to_qpixmap
 from studio.qt.widgets import (
     BTN_HEIGHT,
@@ -53,6 +58,23 @@ from studio.qt.widgets import (
     toolbar_separator,
 )
 from studio.qt.win32 import apply_capture_exclusion_for_hwnd
+
+# Compact POI crop panel (Run tab)
+_CROP_CARD_MAX_W = 196
+_CROP_PREVIEW_MAX = 168
+_CLS_BORDER = {"positive": "#10b981", "negative": "#ef4444", "invalid": "#f59e0b"}
+_CLS_BADGE = {
+    "positive": ("+", "POS", "#064e3b", "#34d399"),
+    "negative": ("−", "NEG", "#7f1d1d", "#fca5a5"),
+    "invalid": ("!", "INV", "#78350f", "#fcd34d"),
+}
+
+
+def _cls_status_short(cls_name: str | None, conf: float) -> str:
+    if not cls_name or cls_name not in _CLS_BADGE:
+        return ""
+    icon, abbr, _, _ = _CLS_BADGE[cls_name]
+    return f"{icon}{abbr} {conf:.0%}"
 
 
 class ViewerTab(QWidget):
@@ -91,7 +113,11 @@ class ViewerTab(QWidget):
         self._last_infer_frame: np.ndarray | None = None
         self._last_infer_result = None
 
+        self.result_classifier = None
+        self._load_result_classifier()
+
         self._build_ui()
+        self._update_capture_visible_cb_state()
         self._load_model()
         self._refresh_camera_list_background()
 
@@ -110,7 +136,15 @@ class ViewerTab(QWidget):
         self._source_combo.addItems(["Camera", "Screen"])
         self._source_combo.setToolTip("Live input: webcam or full screen")
         self._source_combo.currentTextChanged.connect(self._on_live_source_changed)
+        self._source_combo.currentTextChanged.connect(self._update_capture_visible_cb_state)
         normalize_toolbar_widget(self._source_combo)
+        self._capture_visible_cb = QCheckBox("Visible in screen capture")
+        self._capture_visible_cb.setToolTip(
+            "Show this window in screen recordings and screen-share. "
+            "When off and live source is Screen, the app hides itself to avoid mirroring."
+        )
+        self._capture_visible_cb.stateChanged.connect(self._on_capture_visible_changed)
+        normalize_toolbar_widget(self._capture_visible_cb)
         self._cam_combo = QComboBox()
         self._cam_combo.addItem("0")
         self._cam_combo.setToolTip("Camera device index")
@@ -142,7 +176,9 @@ class ViewerTab(QWidget):
             ], tooltip="Open an image or folder"),
             make_menu_button("Model ▾", [
                 ("Choose model .pt…", self._choose_model),
-                ("Load latest from runs/", self._load_last_trained)
+                ("Load latest from runs/", self._load_last_trained),
+                ("-", None),
+                ("Load result classifier…", self._choose_result_classifier),
             ], tooltip="Load YOLO weights"),
             toolbar_separator(),
             make_button("◀", self._prev_image, style="compact", tooltip="Previous image (←)"),
@@ -150,6 +186,7 @@ class ViewerTab(QWidget):
             toolbar_separator(),
             live_lbl,
             self._source_combo,
+            self._capture_visible_cb,
             self._cam_combo,
             make_button("↻", self._refresh_camera_list_background, style="compact",
                         tooltip="Scan for connected cameras"),
@@ -168,14 +205,11 @@ class ViewerTab(QWidget):
         fr = QHBoxLayout(footer_row)
         fr.setContentsMargins(0, 0, 0, 0)
         self._autolabel_counter_lbl = QLabel("")
-        self._autolabel_counter_lbl.setStyleSheet(f"color: {ORANGE}; font-weight: bold;")
+        self._autolabel_counter_lbl.setObjectName("autolabelCounterLabel")
         fr.addWidget(self._autolabel_counter_lbl)
         fr.addStretch(1)
         dev = QLabel(f"Device: {self.device.upper()}")
-        dev.setStyleSheet(
-            "background:#222;color:#00a86b;font-family:Consolas;font-size:9pt;"
-            "padding:4px 10px;border-radius:6px;border:1px solid #333;"
-        )
+        dev.setObjectName("deviceBadgeLabel")
         normalize_toolbar_widget(dev, height=BTN_HEIGHT - 4)
         fr.setAlignment(Qt.AlignmentFlag.AlignVCenter)
         fr.addWidget(dev)
@@ -196,7 +230,7 @@ class ViewerTab(QWidget):
         self._left_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._left_label.setMinimumSize(320, 240)
         self._left_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self._left_label.setStyleSheet("background:#222;border:1px solid #333;")
+        self._left_label.setObjectName("leftImageLabel")
         left_wrap.addWidget(self._left_label, 1)
 
         right_wrap = QVBoxLayout()
@@ -207,11 +241,17 @@ class ViewerTab(QWidget):
         right_wrap.addLayout(rh)
         self._crops_scroll = QScrollArea()
         self._crops_scroll.setWidgetResizable(True)
+        self._crops_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._crops_inner = QWidget()
         self._crops_inner_layout = QGridLayout(self._crops_inner)
+        self._crops_inner_layout.setSpacing(8)
+        self._crops_inner_layout.setContentsMargins(6, 6, 6, 6)
+        self._crops_inner_layout.setColumnStretch(0, 0)
+        self._crops_inner_layout.setColumnStretch(1, 0)
         self._crops_scroll.setWidget(self._crops_inner)
-        self._crops_scroll.setMinimumWidth(280)
-        self._crops_scroll.setStyleSheet("background:#222;border:1px solid #333;")
+        self._crops_scroll.setMinimumWidth(220)
+        self._crops_scroll.setMaximumWidth(420)
+        self._crops_scroll.setObjectName("cropsScrollArea")
         right_wrap.addWidget(self._crops_scroll, 1)
 
         mid.addLayout(left_wrap, 2)
@@ -231,14 +271,14 @@ class ViewerTab(QWidget):
         st.addWidget(self._autolabel_path_lbl)
         sb = QWidget()
         sb.setLayout(st)
-        sb.setStyleSheet("background:#1a1a1a;")
+        sb.setObjectName("bottomStatusBar")
         root.addWidget(sb)
 
     @staticmethod
     def _accent_bar() -> QWidget:
         w = QWidget()
         w.setFixedSize(3, 14)
-        w.setStyleSheet("background:#00a86b;")
+        w.setStyleSheet(f"background:{ACCENT};")
         return w
 
     def _set_status(self, text: str) -> None:
@@ -251,19 +291,47 @@ class ViewerTab(QWidget):
         w = self.window()
         return int(w.winId()) if w else 0
 
-    def _apply_screen_exclusion(self) -> None:
+    def _should_hide_from_capture(self) -> bool:
+        if sys.platform != "win32" or not self.live_running:
+            return False
+        source = self.active_live_source or self._source_combo.currentText()
+        return source == "Screen" and not self._capture_visible_cb.isChecked()
+
+    def _apply_capture_exclusion_state(self, *, announce: bool = False) -> None:
         hwnd = self._hwnd()
-        ok = apply_capture_exclusion_for_hwnd(hwnd, True)
-        self._screen_excluded = ok
-        if ok:
-            self._set_status("Screen exclusion active — app hidden from capture")
+        hide = self._should_hide_from_capture()
+        if hide:
+            ok = apply_capture_exclusion_for_hwnd(hwnd, True)
+            self._screen_excluded = ok
+            if announce:
+                if ok:
+                    self._set_status("App hidden from screen capture")
+                else:
+                    self._set_status("Screen exclusion not available (requires Windows 10 2004+)")
         else:
-            self._set_status("Screen exclusion not available (requires Windows 10 2004+)")
+            apply_capture_exclusion_for_hwnd(hwnd, False)
+            self._screen_excluded = False
+            if announce and self._capture_visible_cb.isChecked():
+                self._set_status("App visible in screen capture")
 
     def _remove_screen_exclusion(self) -> None:
-        if self._screen_excluded:
-            apply_capture_exclusion_for_hwnd(self._hwnd(), False)
-            self._screen_excluded = False
+        if sys.platform != "win32":
+            return
+        apply_capture_exclusion_for_hwnd(self._hwnd(), False)
+        self._screen_excluded = False
+
+    def _on_capture_visible_changed(self, _state: int) -> None:
+        if self.live_running:
+            self._apply_capture_exclusion_state(announce=True)
+
+    def _update_capture_visible_cb_state(self, _text: str = "") -> None:
+        on_win = sys.platform == "win32"
+        is_screen = self._source_combo.currentText() == "Screen"
+        self._capture_visible_cb.setEnabled(on_win and is_screen)
+        if not on_win:
+            self._capture_visible_cb.setToolTip("Requires Windows 10 2004+")
+        if self.live_running and is_screen:
+            self._apply_capture_exclusion_state(announce=False)
 
     def _load_model(self) -> None:
         if not self.model_path.exists():
@@ -502,7 +570,7 @@ class ViewerTab(QWidget):
             else:
                 self._start_camera_reader()
         elif new_source == "Screen":
-            self._apply_screen_exclusion()
+            self._apply_capture_exclusion_state(announce=True)
         self.active_live_source = new_source
 
     def _start_live(self) -> None:
@@ -517,7 +585,7 @@ class ViewerTab(QWidget):
                 return
             self._start_camera_reader()
         elif source == "Screen":
-            self._apply_screen_exclusion()
+            self._apply_capture_exclusion_state(announce=True)
         self.active_live_source = source
         self._inference_pending = False
         self.live_running = True
@@ -735,7 +803,6 @@ class ViewerTab(QWidget):
             return overlay, [], status
 
         all_crops: list[dict] = []
-        rect_summaries: list[str] = []
         all_corners = obb.xyxyxyxy.cpu().numpy()
         for i, corners in enumerate(all_corners):
             color = POI_COLORS[i % len(POI_COLORS)]
@@ -769,16 +836,97 @@ class ViewerTab(QWidget):
                 "bbox": (int(np.min(rect_pts[:, 0])), int(np.min(rect_pts[:, 1])),
                          int(np.max(rect_pts[:, 0])), int(np.max(rect_pts[:, 1]))),
             })
-            x0, y0 = int(np.min(rect_pts[:, 0])), int(np.min(rect_pts[:, 1]))
-            x1, y1 = int(np.max(rect_pts[:, 0])), int(np.max(rect_pts[:, 1]))
-            rect_summaries.append(f"{i + 1}:({x0},{y0})-({x1},{y1})")
+        # Classify each crop with ResNet-34 if loaded
+        cls_summaries: list[str] = []
+        if self.result_classifier is not None:
+            from studio.crop_ops import letterbox, RESULT_CLS_IMGSZ
+            for crop_info in all_crops:
+                try:
+                    crop_lb = letterbox(crop_info["image"], RESULT_CLS_IMGSZ)
+                    cls_name, conf = self.result_classifier.predict(crop_lb)
+                    crop_info["result_class"] = cls_name
+                    crop_info["result_conf"] = conf
+                    short = _cls_status_short(cls_name, conf)
+                    cls_summaries.append(f"P{crop_info['index']} {short}")
+                except Exception:
+                    crop_info["result_class"] = None
+                    crop_info["result_conf"] = 0.0
+
         n = len(all_crops)
         poi_word = "POI" if n == 1 else "POIs"
-        rects_text = ", ".join(rect_summaries)
-        status = f"{n} {poi_word} detected | {rects_text}"
+        if cls_summaries:
+            status = f"{n} {poi_word} | " + " · ".join(cls_summaries)
+        else:
+            status = f"{n} {poi_word} detected"
         if self.image_paths:
             status = f"[{self.index + 1}/{len(self.image_paths)}] {status}"
         return overlay, all_crops, status
+
+    def _make_poi_crop_card(self, crop_info: dict) -> QWidget:
+        """Compact crop card: short header + centered thumbnail (no wide bbox text)."""
+        cls_name = crop_info.get("result_class")
+        cls_conf = crop_info.get("result_conf", 0.0)
+        border_color = _CLS_BORDER.get(cls_name, "#444")
+        bbox = crop_info["bbox"]
+        tip = (
+            f"{crop_info['label']}\n"
+            f"Box: ({bbox[0]}, {bbox[1]}) – ({bbox[2]}, {bbox[3]})"
+        )
+        if cls_name:
+            tip += f"\nResult: {cls_name} ({cls_conf:.0%})"
+
+        card = QWidget()
+        card.setMaximumWidth(_CROP_CARD_MAX_W)
+        card.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Maximum)
+        card.setStyleSheet(
+            f"background:{BG_INPUT}; border:2px solid {border_color}; border-radius:6px;"
+        )
+        card.setToolTip(tip)
+        root = QVBoxLayout(card)
+        root.setContentsMargins(0, 0, 0, 6)
+        root.setSpacing(4)
+
+        hdr = QWidget()
+        hdr.setStyleSheet(
+            f"background:{crop_info['color_hex']}; border-top-left-radius:4px;"
+            f"border-top-right-radius:4px;"
+        )
+        hdr_lay = QHBoxLayout(hdr)
+        hdr_lay.setContentsMargins(8, 4, 8, 4)
+        poi_lbl = QLabel(f"#{crop_info['index']}")
+        poi_lbl.setStyleSheet("color:#000; font-weight:bold; font-size:10pt;")
+        hdr_lay.addWidget(poi_lbl)
+        hdr_lay.addStretch(1)
+        if cls_name and cls_name in _CLS_BADGE:
+            icon, abbr, bg, fg = _CLS_BADGE[cls_name]
+            badge = QLabel(f"{icon} {abbr} {cls_conf:.0%}")
+            badge.setStyleSheet(
+                f"background:{bg}; color:{fg}; font-weight:bold; font-size:9pt;"
+                f"padding:2px 6px; border-radius:4px;"
+            )
+            hdr_lay.addWidget(badge)
+        root.addWidget(hdr)
+
+        crop_bgr = crop_info["image"]
+        ch, cw = crop_bgr.shape[:2]
+        scale = min(_CROP_PREVIEW_MAX / max(cw, 1), _CROP_PREVIEW_MAX / max(ch, 1), 1.0)
+        dw, dh = max(1, int(cw * scale)), max(1, int(ch * scale))
+        interp = cv2.INTER_CUBIC if scale > 1.0 else cv2.INTER_AREA
+        resized = cv2.resize(crop_bgr, (dw, dh), interpolation=interp)
+        pm = numpy_bgr_to_qpixmap(resized)
+
+        img_wrap = QWidget()
+        img_wrap.setStyleSheet(f"background:{BG_PANEL};")
+        img_lay = QHBoxLayout(img_wrap)
+        img_lay.setContentsMargins(4, 6, 4, 4)
+        il = QLabel()
+        il.setPixmap(pm)
+        il.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        img_lay.addStretch(1)
+        img_lay.addWidget(il)
+        img_lay.addStretch(1)
+        root.addWidget(img_wrap)
+        return card
 
     def _set_preview_images(self, overlay_bgr: np.ndarray, crops_data: list[dict]) -> None:
         pm = numpy_bgr_to_qpixmap(overlay_bgr)
@@ -790,56 +938,23 @@ class ViewerTab(QWidget):
                 item.widget().deleteLater()
         if not crops_data:
             lbl = QLabel("No POI detected")
-            lbl.setStyleSheet(f"color: {FG_DIM}; padding: 40px;")
+            lbl.setStyleSheet(f"color: {FG_DIM}; padding: 24px;")
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self._crops_inner_layout.addWidget(lbl, 0, 0)
             return
-        cols = 2
+        cols = 2 if len(crops_data) > 1 else 1
         for idx, crop_info in enumerate(crops_data):
             row, col = divmod(idx, cols)
-            card = QWidget()
-            card.setStyleSheet(f"background:#2a2a2a; border:1px solid #333;")
-            vl = QVBoxLayout(card)
-            hdr = QLabel(f"  {crop_info['label']}   ({crop_info['bbox'][0]},{crop_info['bbox'][1]})-({crop_info['bbox'][2]},{crop_info['bbox'][3]})")
-            hdr.setStyleSheet(f"background:{crop_info['color_hex']}; color:#000; font-weight:bold;")
-            vl.addWidget(hdr)
-            crop_bgr = crop_info["image"]
-            ch, cw = crop_bgr.shape[:2]
-            target_size = 250
-            scale = min(target_size / max(cw, 1), target_size / max(ch, 1), 1.0)
-            dw, dh = max(1, int(cw * scale)), max(1, int(ch * scale))
-            interp = cv2.INTER_CUBIC if scale > 1.0 else cv2.INTER_AREA
-            resized = cv2.resize(crop_bgr, (dw, dh), interpolation=interp)
-            il = QLabel()
-            il.setPixmap(numpy_bgr_to_qpixmap(resized))
-            vl.addWidget(il)
-            self._crops_inner_layout.addWidget(card, row, col)
+            card = self._make_poi_crop_card(crop_info)
+            self._crops_inner_layout.addWidget(card, row, col, Qt.AlignmentFlag.AlignTop)
 
     @staticmethod
     def _order_quad_points(pts: np.ndarray) -> np.ndarray:
-        sums = pts.sum(axis=1)
-        diffs = np.diff(pts, axis=1).reshape(-1)
-        ordered = np.zeros((4, 2), dtype=np.float32)
-        ordered[0] = pts[np.argmin(sums)]
-        ordered[2] = pts[np.argmax(sums)]
-        ordered[1] = pts[np.argmin(diffs)]
-        ordered[3] = pts[np.argmax(diffs)]
-        return ordered
+        return order_quad_points(pts)
 
     @staticmethod
     def _warp_quad_crop(bgr: np.ndarray, quad: np.ndarray) -> np.ndarray:
-        tl, tr, br, bl = quad
-        width_top = np.linalg.norm(tr - tl)
-        width_bottom = np.linalg.norm(br - bl)
-        height_right = np.linalg.norm(br - tr)
-        height_left = np.linalg.norm(bl - tl)
-        out_w = max(1, int(round(max(width_top, width_bottom))))
-        out_h = max(1, int(round(max(height_right, height_left))))
-        dst = np.array(
-            [[0, 0], [out_w - 1, 0], [out_w - 1, out_h - 1], [0, out_h - 1]],
-            dtype=np.float32,
-        )
-        matrix = cv2.getPerspectiveTransform(quad, dst)
-        return cv2.warpPerspective(bgr, matrix, (out_w, out_h))
+        return warp_quad_crop(bgr, quad)
 
     def _load_last_trained(self) -> None:
         self._stop_live()
@@ -869,6 +984,32 @@ class ViewerTab(QWidget):
                 pts = [(int(x), int(y)) for x, y in quad]
                 points_list.append(pts)
         return points_list
+
+    # ── Result classifier (ResNet-34) ────────────────────────────────────────
+
+    def _load_result_classifier(self) -> None:
+        from studio.result_cls_ops import load_result_classifier
+        self.result_classifier = load_result_classifier(device=self.device)
+
+    def _choose_result_classifier(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Choose result classifier", "", "PyTorch (*.pt);;All (*.*)")
+        if not path:
+            return
+        from studio.result_cls_ops import ResNet34Classifier
+        try:
+            self.result_classifier = ResNet34Classifier(Path(path), device=self.device)
+            self._set_status(f"Result classifier loaded: {Path(path).name}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load classifier: {e}")
+
+    def load_result_classifier(self, path: str) -> None:
+        """Public: load classifier from path (called from shell/train tab)."""
+        from studio.result_cls_ops import ResNet34Classifier
+        try:
+            self.result_classifier = ResNet34Classifier(Path(path), device=self.device)
+            self._set_status(f"Result classifier loaded: {Path(path).name}")
+        except Exception as e:
+            self._set_status(f"Failed to load classifier: {e}")
 
     def close_cleanup(self) -> None:
         self._stop_live()

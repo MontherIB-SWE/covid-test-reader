@@ -22,6 +22,8 @@ data/labeled/
 data/unlabeled/
 data/autolabel/
 data/assets/
+data/result_cls/augmented/
+data/result_cls/crops/
 to_submit/
 # Outputs (build artifacts)
 outputs/

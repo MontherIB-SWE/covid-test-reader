@@ -25,6 +25,7 @@ import studio.pipeline as pipeline
 from studio.config import DATASET_PATHS_JSON, FG_DIM, SUPPORTED_EXTENSIONS
 from studio.pipeline import extract_assets
 from studio.qt.relabel_widget import RelabelWidget
+from studio.qt.result_label_widget import ResultLabelWidget
 from studio.qt.widgets import make_button
 
 
@@ -49,7 +50,10 @@ class DataTab(QWidget):
         dataset = QWidget()
         self._build_dataset_panel(dataset)
         self.tabs.addTab(dataset, "Dataset")
+        self.result_label = ResultLabelWidget()
+        self.tabs.addTab(self.result_label, "Results")
         lay.addWidget(self.tabs)
+        self.relabel.label_saved.connect(self.result_label.mark_needs_regen)
         self._try_restore_paths()
 
     def focus_label_tab(self) -> None:
@@ -109,7 +113,7 @@ class DataTab(QWidget):
         self.path_backgrounds_lbl = QLabel("Backgrounds: —")
         for lb in (self.path_images_lbl, self.path_labels_lbl, self.path_output_lbl, self.path_backgrounds_lbl):
             lb.setWordWrap(True)
-            lb.setStyleSheet(f"color:{FG_DIM}; font-family:Consolas; font-size:9pt;")
+            lb.setObjectName("pathLabel")
         g.addWidget(self.path_images_lbl, r, 0, 1, 2)
         r += 1
         g.addWidget(self.path_labels_lbl, r, 0, 1, 2)
@@ -122,7 +126,7 @@ class DataTab(QWidget):
         row = QHBoxLayout()
         row.addWidget(
             make_button("Extract POI crops", self._run_extract, style="primary", min_width=160,
-                        tooltip="Crop POIs from images+labels into cache/assets"),
+                tooltip="Crop POIs from images+labels into cache/assets"),
         )
         row.addWidget(QLabel("Step 1 — builds assets under output/.poi_studio_cache/assets"))
         v.addLayout(row)
@@ -135,7 +139,7 @@ class DataTab(QWidget):
         gen.addWidget(self.synth_count)
         gen.addWidget(
             make_button("Generate composites", self._run_generate, style="primary", min_width=180,
-                        tooltip="Step 2 — paste assets onto background images"),
+                tooltip="Step 2 — paste assets onto background images"),
         )
         gen.addWidget(QLabel("Writes output/images + output/labels"))
         gen.addStretch(1)
@@ -145,7 +149,7 @@ class DataTab(QWidget):
         st.addWidget(QLabel("<b>Status</b>"))
         self.pipeline_status = QLabel("Choose folders → Extract → Generate.")
         self.pipeline_status.setWordWrap(True)
-        self.pipeline_status.setStyleSheet(f"color:{FG_DIM};")
+        self.pipeline_status.setObjectName("statusLabel")
         st.addWidget(self.pipeline_status, 1)
         v.addLayout(st)
         v.addStretch(1)

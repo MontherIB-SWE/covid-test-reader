@@ -36,7 +36,9 @@ from studio.config import (
     DEFAULT_PATIENCE,
     FG_DIM,
     OUTPUTS_DIR,
+    RESULT_CLS_BUNDLE_DIR,
     RUNS_DIR,
+    SUPPORTED_EXTENSIONS,
     TRAIN_SOURCES_JSON,
 )
 from studio.train_ops import VAL_FRACTION, prepare_mixed_train_bundle, prepare_train_bundle, train_device
@@ -124,7 +126,7 @@ class TrainTab(QWidget):
         rw.addWidget(self._rb_retrain)
         rw.addWidget(make_button("Browse .pt…", self._browse_weights, tooltip="Weights for continue training"))
         self.weights_lbl = QLabel("(none)")
-        self.weights_lbl.setStyleSheet(f"color:{FG_DIM};")
+        self.weights_lbl.setObjectName("statusLabel")
         rw.addWidget(self.weights_lbl, 1)
         mod_l.addLayout(rw)
         root.addWidget(mod)
@@ -171,6 +173,57 @@ class TrainTab(QWidget):
         self.models_list.setMinimumHeight(100)
         fl.addWidget(self.models_list)
         root.addWidget(foot)
+
+        # ── Result classification (ResNet-50) ─────────────────────────────────
+        cls_grp = QGroupBox("Result classification (ResNet-50)")
+        cls_lay = QVBoxLayout(cls_grp)
+        cls_lay.addWidget(QLabel(
+            "Train a 3-class classifier (positive / negative / invalid) on warped POI crops."
+        ))
+        cls_opts = QGridLayout()
+        self._cls_epochs = QLineEdit("100")
+        self._cls_batch = QLineEdit("32")
+        self._cls_lr = QLineEdit("0.001")
+        self._cls_patience = QLineEdit("20")
+        for i, (name, w) in enumerate([
+            ("Epochs", self._cls_epochs), ("Batch", self._cls_batch),
+            ("LR", self._cls_lr), ("Patience", self._cls_patience),
+        ]):
+            cls_opts.addWidget(QLabel(name), 0, i)
+            w.setFixedWidth(72)
+            cls_opts.addWidget(w, 1, i)
+        cls_lay.addLayout(cls_opts)
+
+        bundle_lay = QVBoxLayout()
+        bundle_lay.addWidget(make_button("Build bundle from manifest",
+                                         self._build_cls_bundle, style="primary",
+                                         tooltip="Read manifest.csv + crops → ImageFolder bundle"))
+        bundle_lay.addWidget(make_button("Browse ready data…",
+                                         self._browse_cls_bundle,
+                                         tooltip="Pick a folder with train/val/{class}/ layout"))
+        cls_lay.addLayout(bundle_lay)
+
+        self._cls_bundle_dir: Path | None = RESULT_CLS_BUNDLE_DIR
+        self._cls_bundle_lbl = QLabel(f"Bundle: {RESULT_CLS_BUNDLE_DIR}")
+        self._cls_bundle_lbl.setObjectName("statusLabel")
+        self._cls_bundle_lbl.setWordWrap(True)
+        cls_lay.addWidget(self._cls_bundle_lbl)
+
+        cls_train_row = QHBoxLayout()
+        cls_train_row.addWidget(make_button("Train ResNet-50",
+                                          self._start_cls_train_only, style="primary",
+                                          min_width=140,
+                                          tooltip="Train on current bundle folder"))
+        self._cls_progress = QProgressBar()
+        self._cls_progress.setRange(0, 100)
+        self._cls_progress.setValue(0)
+        cls_train_row.addWidget(self._cls_progress, 1)
+        cls_lay.addLayout(cls_train_row)
+        self._cls_status = QLabel("Build a bundle or browse to ready data, then train.")
+        self._cls_status.setWordWrap(True)
+        cls_lay.addWidget(self._cls_status)
+        root.addWidget(cls_grp)
+
         root.addStretch(1)
 
         self._load_sources_json()
@@ -187,6 +240,24 @@ class TrainTab(QWidget):
                 self.train_status.setText(item[1])
             elif item[0] == "train_complete":
                 self._training_complete(item[1], item[2])
+            elif item[0] == "cls_status":
+                self._cls_status.setText(item[1])
+            elif item[0] == "cls_progress":
+                epoch, total = item[1], item[2]
+                self._cls_progress.setRange(0, total)
+                self._cls_progress.setValue(epoch)
+            elif item[0] == "cls_bundle_lbl":
+                self._cls_bundle_lbl.setText(item[1])
+            elif item[0] == "cls_progress_done":
+                self._cls_progress.setRange(0, 100)
+                self._cls_progress.setValue(100)
+            elif item[0] == "cls_done":
+                success, msg = item[1], item[2]
+                self._cls_progress.setRange(0, 100)
+                self._cls_progress.setValue(100 if success else 0)
+                self._cls_status.setText(msg)
+                if success:
+                    self._cls_training_complete()
 
     def _sources_json_path(self) -> Path:
         OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -475,6 +546,151 @@ class TrainTab(QWidget):
                         self.models_list.addItem(s)
         except OSError:
             pass
+
+    # ── Result classification (ResNet-50) ────────────────────────────────────
+
+    def _cls_training_complete(self) -> None:
+        from studio.config import resolve_result_cls_model_path
+        path = resolve_result_cls_model_path()
+        if path and path.is_file():
+            if QMessageBox.question(
+                self, "Load classifier",
+                f"Classifier training complete.\nLoad {path.name} on Run tab?",
+            ) == QMessageBox.StandardButton.Yes:
+                mw = self._main
+                if hasattr(mw, "load_result_classifier"):
+                    mw.load_result_classifier(str(path))
+
+    def _browse_cls_bundle(self) -> None:
+        d = QFileDialog.getExistingDirectory(self, "Select bundle folder (must have train/val subdirs)")
+        if not d:
+            return
+        p = Path(d).resolve()
+        err = self._validate_cls_bundle(p)
+        if err:
+            QMessageBox.warning(self, "Invalid bundle", err)
+            return
+        self._cls_bundle_dir = p
+        self._cls_bundle_lbl.setText(f"Bundle: {p}")
+        self._cls_status.setText(f"Ready — bundle set to: {p}")
+
+    def _validate_cls_bundle(self, bundle_dir: Path) -> str | None:
+        """Check bundle has train/val with at least one class subfolder containing images."""
+        for split in ("train", "val"):
+            split_dir = bundle_dir / split
+            if not split_dir.is_dir():
+                return f"Missing '{split}/' subfolder in {bundle_dir}"
+            has_images = False
+            for cls_dir in split_dir.iterdir():
+                if cls_dir.is_dir():
+                    for f in cls_dir.iterdir():
+                        if f.is_file() and f.suffix.lower() in SUPPORTED_EXTENSIONS:
+                            has_images = True
+                            break
+                if has_images:
+                    break
+            if not has_images:
+                return f"No images found in {split_dir}/ class subdirectories."
+        return None
+
+    def _build_cls_bundle(self) -> None:
+        from studio.result_cls_ops import build_result_cls_bundle, read_manifest
+        manifest = read_manifest()
+        if len(manifest) < 6:
+            QMessageBox.warning(self, "Not enough data",
+                                "Label at least a few images per class in Data → Results.")
+            return
+        self._cls_status.setText("Building bundle…")
+        self._cls_progress.setRange(0, 0)
+
+        def _worker():
+            try:
+                bundle_dir, _n_train, _n_val, stats = build_result_cls_bundle(manifest)
+                self._cls_bundle_dir = bundle_dir
+                self._tab_ui_queue.put(("cls_bundle_lbl", f"Bundle: {bundle_dir}"))
+                self._tab_ui_queue.put((
+                    "cls_status",
+                    f"✅ Bundle ready — {stats['n_train_total']} train / {stats['n_val_total']} val "
+                    f"(incl. {stats['n_aug_train']}+{stats['n_aug_val']} aug). Now press Train.",
+                ))
+                self._tab_ui_queue.put(("cls_progress_done",))
+            except Exception as e:
+                self._tab_ui_queue.put(("cls_done", False, f"Error: {e}"))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _start_cls_train_only(self) -> None:
+        from studio.result_cls_ops import build_result_cls_bundle, read_manifest, train_resnet34
+        if self._cls_bundle_dir is None:
+            QMessageBox.warning(self, "No bundle",
+                                "Build a bundle from manifest or browse to a ready data folder first.")
+            return
+        bundle_dir = Path(self._cls_bundle_dir).resolve()
+        # Auto-build from manifest if the default bundle dir isn't ready yet
+        need_auto_build = False
+        if bundle_dir == RESULT_CLS_BUNDLE_DIR.resolve():
+            err = self._validate_cls_bundle(bundle_dir)
+            if err:
+                manifest = read_manifest()
+                if len(manifest) < 6:
+                    QMessageBox.warning(self, "No data",
+                                        "Bundle folder is empty and manifest has < 6 entries.\n"
+                                        "Label images in Data → Results, or browse to a ready folder.")
+                    return
+                need_auto_build = True
+        else:
+            err = self._validate_cls_bundle(bundle_dir)
+            if err:
+                QMessageBox.warning(self, "Invalid bundle", err)
+                return
+        try:
+            epochs = int(self._cls_epochs.text())
+            batch = int(self._cls_batch.text())
+            lr = float(self._cls_lr.text())
+            patience = int(self._cls_patience.text())
+        except ValueError:
+            QMessageBox.critical(self, "Options", "Enter valid numbers for epochs, batch, LR, patience.")
+            return
+
+        if need_auto_build:
+            self._cls_status.setText("Building bundle from manifest…")
+        else:
+            self._cls_status.setText(f"Training on {bundle_dir}…")
+        self._cls_progress.setRange(0, 0)
+
+        def _worker():
+            try:
+                actual_bundle = bundle_dir
+                if need_auto_build:
+                    manifest = read_manifest()
+                    actual_bundle, _n_tr, _n_val, stats = build_result_cls_bundle(manifest)
+                    self._tab_ui_queue.put(("cls_bundle_lbl", f"Bundle: {actual_bundle}"))
+                    self._tab_ui_queue.put((
+                        "cls_status",
+                        f"Training… ({stats['n_train_total']} train / {stats['n_val_total']} val, "
+                        f"incl. {stats['n_aug_train']}+{stats['n_aug_val']} aug)",
+                    ))
+
+                def _progress_cb(epoch, total, train_loss, val_acc):
+                    self._tab_ui_queue.put(("cls_progress", epoch, total))
+                    self._tab_ui_queue.put(("cls_status",
+                                            f"Epoch {epoch}/{total} | loss={train_loss:.4f} | val_acc={val_acc:.3f}"))
+
+                metrics = train_resnet34(
+                    bundle_dir=actual_bundle,
+                    epochs=epochs,
+                    batch=batch,
+                    lr=lr,
+                    patience=patience,
+                    progress_cb=_progress_cb,
+                )
+                self._tab_ui_queue.put(("cls_done", True,
+                                        f"Done! Val acc={metrics['final_val_acc']:.3f}, "
+                                        f"best epoch={metrics['best_epoch']}"))
+            except Exception as e:
+                self._tab_ui_queue.put(("cls_done", False, f"Error: {e}"))
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def close_cleanup(self) -> None:
         self._poll.stop()
