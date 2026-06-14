@@ -45,10 +45,12 @@ from studio.qt.images import numpy_bgr_to_qpixmap
 from studio.qt.widgets import make_button
 from studio.result_cls_ops import (
     RESULT_CLASSES,
+    SOURCE_LABELED,
+    ManifestEntry,
     export_crops_for_folder,
     generate_augmented_crops,
     read_manifest,
-    write_manifest,
+    upsert_manifest_entry,
     load_result_classifier,
 )
 
@@ -86,7 +88,7 @@ class ResultLabelWidget(QWidget):
         toolbar.addWidget(QLabel("<b style='color:#00a86b;'>Results</b> — antigen read labeling"))
         toolbar.addStretch(1)
         toolbar.addWidget(make_button("Open folder…", self._open_folder, style="primary"))
-        toolbar.addWidget(make_button("Regen all crops", self._regen_crops, tooltip="Re-export all 224×224 crops"))
+        toolbar.addWidget(make_button("Regen all crops", self._regen_crops, tooltip="Re-export all 448×448 crops"))
         aug_row = QHBoxLayout()
         aug_row.addWidget(QLabel("Aug / stem:"))
         self._aug_per_stem = QLineEdit(str(RESULT_CLS_AUG_PER_STEM))
@@ -104,6 +106,9 @@ class ResultLabelWidget(QWidget):
         toolbar.addWidget(make_button("Build bundle", self._build_bundle, style="primary",
                                       tooltip="Original crops + augmented → outputs/result_cls_bundle"))
         root.addLayout(toolbar)
+        hint = QLabel("Live saves from Run tab appear here after refresh or when you open this tab.")
+        hint.setStyleSheet(f"color:{FG_DIM}; font-size:9pt;")
+        root.addWidget(hint)
 
         # Main area with Tab Widget
         self._tab_widget = QTabWidget()
@@ -119,7 +124,9 @@ class ResultLabelWidget(QWidget):
         filter_row = QHBoxLayout()
         filter_row.addWidget(QLabel("Filter:"))
         self._filter_combo = QComboBox()
-        self._filter_combo.addItems(["All", "Unlabeled", "Positive", "Negative", "Invalid", "No POI"])
+        self._filter_combo.addItems([
+            "All", "Live", "Unlabeled", "Positive", "Negative", "Invalid", "No POI",
+        ])
         self._filter_combo.currentIndexChanged.connect(self._refresh_queue_list)
         filter_row.addWidget(self._filter_combo)
         filter_row.addStretch(1)
@@ -142,7 +149,7 @@ class ResultLabelWidget(QWidget):
 
         # Right: preview + classify buttons
         right = QVBoxLayout()
-        right.addWidget(QLabel("<b>Training crop (224×224)</b> — what ResNet sees"))
+        right.addWidget(QLabel("<b>Training crop (448×448)</b> — what ResNet sees"))
         self._crop_preview = QLabel()
         self._crop_preview.setMinimumSize(280, 280)
         self._crop_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -201,6 +208,11 @@ class ResultLabelWidget(QWidget):
         QShortcut(QKeySequence("U"), self).activated.connect(self._jump_unlabeled)
 
     # ─── Folder + manifest ────────────────────────────────────────────────────
+
+    def reload_manifest(self) -> None:
+        self._manifest = read_manifest()
+        self._refresh_queue_list()
+        self._update_counts()
 
     def _open_folder(self) -> None:
         d = QFileDialog.getExistingDirectory(self, "Choose images folder", str(DATA_LABELED_DIR))
@@ -295,6 +307,8 @@ class ResultLabelWidget(QWidget):
         for stem in self._stems:
             cls = self._manifest.get(stem)
             status = self._crop_status.get(stem, "")
+            if filt == "live" and not stem.startswith("live_"):
+                continue
             if filt == "unlabeled" and cls is not None:
                 continue
             if filt == "positive" and cls != "positive":
@@ -374,8 +388,11 @@ class ResultLabelWidget(QWidget):
         if self._current_idx < 0 or self._current_idx >= len(self._stems):
             return
         stem = self._stems[self._current_idx]
+        session_id = self._images_dir.name if self._images_dir else "legacy"
         self._manifest[stem] = cls
-        write_manifest(self._manifest)
+        upsert_manifest_entry(
+            ManifestEntry(stem=stem, cls=cls, source=SOURCE_LABELED, session_id=session_id),
+        )
         self._refresh_queue_list()
         self._update_counts()
         self._advance_after_classify()
@@ -490,7 +507,7 @@ class ResultLabelWidget(QWidget):
 
     def _build_bundle(self) -> None:
         from studio.result_cls_ops import build_result_cls_bundle
-        labeled_count = sum(1 for s in self._stems if s in self._manifest)
+        labeled_count = sum(1 for c in self._manifest.values() if c in RESULT_CLASSES)
         if labeled_count < 3:
             QMessageBox.warning(self, "Not enough", "Label at least a few images before building.")
             return
@@ -654,6 +671,8 @@ class ResultLabelWidget(QWidget):
             if not cls and stem not in self._stems:
                 continue
 
+            if filt == "live" and not stem.startswith("live_"):
+                continue
             if filt == "unlabeled" and cls is not None:
                 continue
             if filt == "positive" and cls != "positive":

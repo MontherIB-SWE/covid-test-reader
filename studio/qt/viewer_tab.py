@@ -116,10 +116,19 @@ class ViewerTab(QWidget):
         self.result_classifier = None
         self._load_result_classifier()
 
+        self._live_session_id: str | None = None
+        self._live_correction_count = 0
+        self._live_save_in_progress: set[int] = set()
+        self._live_correction_callback = None
+        self._crop_cards: list[QWidget] = []
+
         self._build_ui()
         self._update_capture_visible_cb_state()
         self._load_model()
         self._refresh_camera_list_background()
+        self._ui_drain_timer = QTimer(self)
+        self._ui_drain_timer.timeout.connect(self._drain_live_ui_queue)
+        self._ui_drain_timer.start(100)
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
@@ -167,6 +176,16 @@ class ViewerTab(QWidget):
         )
         self._btn_autolabel.setMinimumWidth(130)
 
+        self._auto_aug_cb = QCheckBox("Auto-augment on save")
+        self._auto_aug_cb.setChecked(True)
+        self._auto_aug_cb.setToolTip(
+            "Adds crop + augmented copies to data/result_cls for retraining"
+        )
+        normalize_toolbar_widget(self._auto_aug_cb)
+        self._live_corr_counter_lbl = QLabel("Live corrections: 0")
+        self._live_corr_counter_lbl.setObjectName("liveCorrCounterLabel")
+        normalize_toolbar_widget(self._live_corr_counter_lbl)
+
         row1 = toolbar_row(
             title,
             toolbar_separator(),
@@ -194,6 +213,9 @@ class ViewerTab(QWidget):
             self._btn_stop,
             toolbar_separator(),
             self._btn_autolabel,
+            toolbar_separator(),
+            self._live_corr_counter_lbl,
+            self._auto_aug_cb,
             make_menu_button("Capture ▾", [
                 ("Send current frame to Relabel", self._capture_for_relabel),
                 ("-", None),
@@ -573,12 +595,22 @@ class ViewerTab(QWidget):
             self._apply_capture_exclusion_state(announce=True)
         self.active_live_source = new_source
 
+    @property
+    def live_session_id(self) -> str | None:
+        return self._live_session_id
+
+    def set_live_correction_callback(self, cb) -> None:
+        self._live_correction_callback = cb
+
     def _start_live(self) -> None:
         if self.model is None:
             QMessageBox.critical(self, "Model not loaded", "Load a valid .pt model first.")
             return
         if self.live_running:
             return
+        from studio.result_cls_ops import make_live_session_id, persist_live_session_id
+        self._live_session_id = make_live_session_id()
+        persist_live_session_id(self._live_session_id)
         source = self._source_combo.currentText()
         if source == "Camera":
             if not self._open_camera_capture():
@@ -632,6 +664,13 @@ class ViewerTab(QWidget):
             if item[0] == "ok":
                 _, overlay, crops, status, raw_frame, result = item
                 self._deliver_live_result(overlay, crops, status, raw_frame, result)
+            elif item[0] == "live_save_ok":
+                _, result, predicted, correct_class, poi_idx = item
+                self._handle_live_save_ok(result, predicted, correct_class, poi_idx)
+            elif item[0] == "live_save_err":
+                _, err, poi_idx = item
+                self._live_save_in_progress.discard(poi_idx)
+                self._set_status(f"Save failed: {err}")
             else:
                 self._deliver_live_error(item[1])
 
@@ -863,7 +902,74 @@ class ViewerTab(QWidget):
         return overlay, all_crops, status
 
     def _make_poi_crop_card(self, crop_info: dict) -> QWidget:
-        """Compact crop card: short header + centered thumbnail (no wide bbox text)."""
+        """Compact crop card: header + preview + save row (stable widgets for live updates)."""
+        card = QWidget()
+        card.setMaximumWidth(_CROP_CARD_MAX_W)
+        card.setMinimumHeight(248)
+        card.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Minimum)
+        root = QVBoxLayout(card)
+        root.setContentsMargins(0, 0, 0, 6)
+        root.setSpacing(4)
+
+        hdr = QWidget()
+        hdr_lay = QHBoxLayout(hdr)
+        hdr_lay.setContentsMargins(8, 4, 8, 4)
+        poi_lbl = QLabel()
+        poi_lbl.setStyleSheet("color:#000; font-weight:bold; font-size:10pt;")
+        hdr_lay.addWidget(poi_lbl)
+        hdr_lay.addStretch(1)
+        badge = QLabel()
+        badge.setVisible(False)
+        hdr_lay.addWidget(badge)
+        root.addWidget(hdr)
+
+        img_wrap = QWidget()
+        img_wrap.setStyleSheet(f"background:{BG_PANEL};")
+        img_lay = QHBoxLayout(img_wrap)
+        img_lay.setContentsMargins(4, 6, 4, 4)
+        il = QLabel()
+        il.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        img_lay.addStretch(1)
+        img_lay.addWidget(il)
+        img_lay.addStretch(1)
+        root.addWidget(img_wrap)
+
+        save_lbl = QLabel("Save correct:")
+        save_lbl.setStyleSheet(f"color:{FG_DIM}; font-size:8pt; padding-left:6px;")
+        root.addWidget(save_lbl)
+        btn_row = QHBoxLayout()
+        btn_row.setContentsMargins(6, 0, 6, 0)
+        btn_row.setSpacing(4)
+        save_buttons: list[QPushButton] = []
+        for save_cls, (icon, abbr, bg, fg) in [
+            ("positive", _CLS_BADGE["positive"]),
+            ("negative", _CLS_BADGE["negative"]),
+            ("invalid", _CLS_BADGE["invalid"]),
+        ]:
+            b = QPushButton(f"{icon} {abbr}")
+            b.setFixedHeight(28)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setStyleSheet(
+                f"background:{bg}; color:{fg}; font-weight:bold; font-size:8pt;"
+                f"border-radius:4px; padding:2px 4px;"
+            )
+            b.setToolTip(f"Save this crop as {save_cls} (+ aug if enabled)")
+            b.clicked.connect(
+                lambda checked=False, c=save_cls, ccard=card: self._save_live_correction_from_card(c, ccard)
+            )
+            btn_row.addWidget(b)
+            save_buttons.append(b)
+        root.addLayout(btn_row)
+
+        card._poi_lbl = poi_lbl  # type: ignore[attr-defined]
+        card._hdr = hdr  # type: ignore[attr-defined]
+        card._badge = badge  # type: ignore[attr-defined]
+        card._preview = il  # type: ignore[attr-defined]
+        card._save_buttons = save_buttons  # type: ignore[attr-defined]
+        self._update_poi_crop_card(card, crop_info)
+        return card
+
+    def _update_poi_crop_card(self, card: QWidget, crop_info: dict) -> None:
         cls_name = crop_info.get("result_class")
         cls_conf = crop_info.get("result_conf", 0.0)
         border_color = _CLS_BORDER.get(cls_name, "#444")
@@ -874,38 +980,30 @@ class ViewerTab(QWidget):
         )
         if cls_name:
             tip += f"\nResult: {cls_name} ({cls_conf:.0%})"
-
-        card = QWidget()
-        card.setMaximumWidth(_CROP_CARD_MAX_W)
-        card.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Maximum)
+        card.setToolTip(tip)
         card.setStyleSheet(
             f"background:{BG_INPUT}; border:2px solid {border_color}; border-radius:6px;"
         )
-        card.setToolTip(tip)
-        root = QVBoxLayout(card)
-        root.setContentsMargins(0, 0, 0, 6)
-        root.setSpacing(4)
+        card._poi_index = crop_info["index"]  # type: ignore[attr-defined]
+        card._save_crop_bgr = crop_info["image"].copy()  # type: ignore[attr-defined]
+        card._predicted_class = cls_name  # type: ignore[attr-defined]
 
-        hdr = QWidget()
-        hdr.setStyleSheet(
+        card._hdr.setStyleSheet(  # type: ignore[attr-defined]
             f"background:{crop_info['color_hex']}; border-top-left-radius:4px;"
             f"border-top-right-radius:4px;"
         )
-        hdr_lay = QHBoxLayout(hdr)
-        hdr_lay.setContentsMargins(8, 4, 8, 4)
-        poi_lbl = QLabel(f"#{crop_info['index']}")
-        poi_lbl.setStyleSheet("color:#000; font-weight:bold; font-size:10pt;")
-        hdr_lay.addWidget(poi_lbl)
-        hdr_lay.addStretch(1)
+        card._poi_lbl.setText(f"#{crop_info['index']}")  # type: ignore[attr-defined]
+        badge = card._badge  # type: ignore[attr-defined]
         if cls_name and cls_name in _CLS_BADGE:
             icon, abbr, bg, fg = _CLS_BADGE[cls_name]
-            badge = QLabel(f"{icon} {abbr} {cls_conf:.0%}")
+            badge.setText(f"{icon} {abbr} {cls_conf:.0%}")
             badge.setStyleSheet(
                 f"background:{bg}; color:{fg}; font-weight:bold; font-size:9pt;"
                 f"padding:2px 6px; border-radius:4px;"
             )
-            hdr_lay.addWidget(badge)
-        root.addWidget(hdr)
+            badge.setVisible(True)
+        else:
+            badge.setVisible(False)
 
         crop_bgr = crop_info["image"]
         ch, cw = crop_bgr.shape[:2]
@@ -913,29 +1011,82 @@ class ViewerTab(QWidget):
         dw, dh = max(1, int(cw * scale)), max(1, int(ch * scale))
         interp = cv2.INTER_CUBIC if scale > 1.0 else cv2.INTER_AREA
         resized = cv2.resize(crop_bgr, (dw, dh), interpolation=interp)
-        pm = numpy_bgr_to_qpixmap(resized)
+        card._preview.setPixmap(numpy_bgr_to_qpixmap(resized))  # type: ignore[attr-defined]
 
-        img_wrap = QWidget()
-        img_wrap.setStyleSheet(f"background:{BG_PANEL};")
-        img_lay = QHBoxLayout(img_wrap)
-        img_lay.setContentsMargins(4, 6, 4, 4)
-        il = QLabel()
-        il.setPixmap(pm)
-        il.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        img_lay.addStretch(1)
-        img_lay.addWidget(il)
-        img_lay.addStretch(1)
-        root.addWidget(img_wrap)
-        return card
+    def _update_live_correction_counter(self) -> None:
+        self._live_corr_counter_lbl.setText(f"Live corrections: {self._live_correction_count}")
 
-    def _set_preview_images(self, overlay_bgr: np.ndarray, crops_data: list[dict]) -> None:
-        pm = numpy_bgr_to_qpixmap(overlay_bgr)
-        pm = pm.scaled(660, 660, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-        self._left_label.setPixmap(pm)
+    def _ensure_live_session_id(self) -> str:
+        if self._live_session_id is None:
+            from studio.result_cls_ops import make_live_session_id, persist_live_session_id
+            self._live_session_id = make_live_session_id()
+            persist_live_session_id(self._live_session_id)
+        return self._live_session_id
+
+    def _save_live_correction_from_card(self, correct_class: str, card: QWidget) -> None:
+        crop_bgr = getattr(card, "_save_crop_bgr", None)
+        poi_idx = getattr(card, "_poi_index", 0)
+        predicted = getattr(card, "_predicted_class", None)
+        self._save_live_correction(correct_class, crop_bgr, poi_idx, predicted)
+
+    def _save_live_correction(
+        self,
+        correct_class: str,
+        crop_bgr: np.ndarray | None,
+        poi_idx: int,
+        predicted_class: str | None,
+    ) -> None:
+        session_id = self._ensure_live_session_id()
+        if poi_idx in self._live_save_in_progress:
+            return
+        if crop_bgr is None:
+            self._set_status("No crop to save.")
+            return
+        self._live_save_in_progress.add(poi_idx)
+        auto_aug = self._auto_aug_cb.isChecked()
+
+        def _worker() -> None:
+            try:
+                from studio.result_cls_ops import save_live_correction
+                result = save_live_correction(
+                    crop_bgr,
+                    correct_class,
+                    poi_index=poi_idx,
+                    session_id=session_id,
+                    predicted_class=predicted_class,
+                    auto_augment=auto_aug,
+                )
+                self._live_ui_queue.put(("live_save_ok", result, predicted_class, correct_class, poi_idx))
+            except Exception as e:
+                self._live_ui_queue.put(("live_save_err", str(e), poi_idx))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _handle_live_save_ok(self, result: dict, predicted: str | None, correct_class: str, poi_idx: int) -> None:
+        self._live_save_in_progress.discard(poi_idx)
+        self._live_correction_count += 1
+        self._update_live_correction_counter()
+        stem = result["stem"]
+        n_aug = result["n_aug"]
+        aug_part = f" (+{n_aug} aug)" if n_aug else ""
+        if predicted and predicted != correct_class:
+            msg = f"Saved correction: {predicted} → {correct_class} | {stem}{aug_part}"
+        else:
+            abbr = _CLS_BADGE.get(correct_class, ("", correct_class.upper(), "", ""))[1]
+            msg = f"Saved {stem} as {abbr}{aug_part} | Live corrections: {self._live_correction_count}"
+        self._set_status(msg)
+        if self._live_correction_callback:
+            self._live_correction_callback()
+
+    def _clear_crop_cards(self) -> None:
         while self._crops_inner_layout.count():
             item = self._crops_inner_layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
+        self._crop_cards = []
+
+    def _rebuild_crop_cards(self, crops_data: list[dict]) -> None:
+        self._clear_crop_cards()
         if not crops_data:
             lbl = QLabel("No POI detected")
             lbl.setStyleSheet(f"color: {FG_DIM}; padding: 24px;")
@@ -946,7 +1097,20 @@ class ViewerTab(QWidget):
         for idx, crop_info in enumerate(crops_data):
             row, col = divmod(idx, cols)
             card = self._make_poi_crop_card(crop_info)
+            self._crop_cards.append(card)
             self._crops_inner_layout.addWidget(card, row, col, Qt.AlignmentFlag.AlignTop)
+
+    def _set_preview_images(self, overlay_bgr: np.ndarray, crops_data: list[dict]) -> None:
+        pm = numpy_bgr_to_qpixmap(overlay_bgr)
+        pm = pm.scaled(660, 660, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        self._left_label.setPixmap(pm)
+        if len(crops_data) != len(self._crop_cards):
+            self._rebuild_crop_cards(crops_data)
+        elif not crops_data:
+            self._rebuild_crop_cards(crops_data)
+        else:
+            for card, crop_info in zip(self._crop_cards, crops_data):
+                self._update_poi_crop_card(card, crop_info)
 
     @staticmethod
     def _order_quad_points(pts: np.ndarray) -> np.ndarray:

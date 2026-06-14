@@ -74,6 +74,7 @@ class PoiStudioWindow(QWidget):
         self.viewer.set_capture_for_relabel_callback(self._open_capture_in_relabel)
         self.relabel.set_save_to_train_callback(self._save_relabel_to_train)
         self.relabel.set_ai_assist_callback(self._predict_for_relabel)
+        self.viewer.set_live_correction_callback(self._on_live_correction_saved)
 
         self._switch_tab(0)
         self._bind_shortcuts()
@@ -90,6 +91,9 @@ class PoiStudioWindow(QWidget):
             QApplication.processEvents()
             hwnd = int(self.winId())
             apply_capture_exclusion_for_hwnd(hwnd, False)
+
+    def _on_live_correction_saved(self) -> None:
+        self.data_tab.result_label.reload_manifest()
 
     def _switch_tab(self, index: int) -> None:
         self._current_tab = index

@@ -10,6 +10,7 @@ from pathlib import Path
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QFileDialog,
     QGridLayout,
     QGroupBox,
@@ -38,6 +39,10 @@ from studio.config import (
     OUTPUTS_DIR,
     RESULT_CLS_BUNDLE_DIR,
     RUNS_DIR,
+    SCOPE_ALL_LIVE,
+    SCOPE_CURRENT_LIVE,
+    SCOPE_FULL,
+    SCOPE_LABELED_ONLY,
     SUPPORTED_EXTENSIONS,
     TRAIN_SOURCES_JSON,
 )
@@ -178,8 +183,26 @@ class TrainTab(QWidget):
         cls_grp = QGroupBox("Result classification (ResNet-50)")
         cls_lay = QVBoxLayout(cls_grp)
         cls_lay.addWidget(QLabel(
+            "Live test → correct on Run crop cards → Build bundle → Train → reload on Run. "
             "Train a 3-class classifier (positive / negative / invalid) on warped POI crops."
         ))
+        scope_row = QHBoxLayout()
+        scope_row.addWidget(QLabel("Training data:"))
+        self._cls_scope = QComboBox()
+        self._cls_scope.addItem("Last / current live session", SCOPE_CURRENT_LIVE)
+        self._cls_scope.addItem("All live corrections", SCOPE_ALL_LIVE)
+        self._cls_scope.addItem("Full dataset", SCOPE_FULL)
+        self._cls_scope.addItem("Labeled only (Results)", SCOPE_LABELED_ONLY)
+        self._cls_scope.setToolTip(
+            "Last/current live session: active Start live, or after restart the last session you saved to"
+        )
+        self._cls_scope.currentIndexChanged.connect(self._update_cls_scope_hint)
+        scope_row.addWidget(self._cls_scope, 1)
+        cls_lay.addLayout(scope_row)
+        self._cls_scope_hint = QLabel("")
+        self._cls_scope_hint.setWordWrap(True)
+        self._cls_scope_hint.setStyleSheet(f"color:{FG_DIM}; font-size:9pt;")
+        cls_lay.addWidget(self._cls_scope_hint)
         cls_opts = QGridLayout()
         self._cls_epochs = QLineEdit("100")
         self._cls_batch = QLineEdit("32")
@@ -195,12 +218,24 @@ class TrainTab(QWidget):
         cls_lay.addLayout(cls_opts)
 
         bundle_lay = QVBoxLayout()
-        bundle_lay.addWidget(make_button("Build bundle from manifest",
-                                         self._build_cls_bundle, style="primary",
-                                         tooltip="Read manifest.csv + crops → ImageFolder bundle"))
-        bundle_lay.addWidget(make_button("Browse ready data…",
-                                         self._browse_cls_bundle,
-                                         tooltip="Pick a folder with train/val/{class}/ layout"))
+        bundle_lay = QHBoxLayout()
+        bundle_lay.addWidget(make_button(
+            "Build bundle from manifest",
+            self._build_cls_bundle,
+            style="primary",
+            tooltip="Read manifest.csv + crops → ImageFolder bundle (scoped)",
+        ))
+        bundle_lay.addWidget(make_button(
+            "Build bundle + Train",
+            self._build_and_train_cls,
+            style="primary",
+            tooltip="Build scoped bundle then train ResNet-50 (resumes from last best.pt if present)",
+        ))
+        bundle_lay.addWidget(make_button(
+            "Browse ready data…",
+            self._browse_cls_bundle,
+            tooltip="Pick a folder with train/val/{class}/ layout",
+        ))
         cls_lay.addLayout(bundle_lay)
 
         self._cls_bundle_dir: Path | None = RESULT_CLS_BUNDLE_DIR
@@ -229,6 +264,7 @@ class TrainTab(QWidget):
         self._load_sources_json()
         self._refresh_sources_listbox()
         self._refresh_models_list()
+        self._update_cls_scope_hint()
 
     def _process_tab_ui_queue(self) -> None:
         while True:
@@ -593,51 +629,158 @@ class TrainTab(QWidget):
                 return f"No images found in {split_dir}/ class subdirectories."
         return None
 
+    def _cls_training_scope(self) -> str:
+        return self._cls_scope.currentData() or SCOPE_FULL
+
+    def _active_live_session_id(self) -> str | None:
+        mw = self._main
+        if hasattr(mw, "viewer"):
+            return mw.viewer.live_session_id
+        return None
+
+    def _live_session_id_for_scope(self) -> str | None:
+        scope = self._cls_training_scope()
+        if scope != SCOPE_CURRENT_LIVE:
+            return None
+        from studio.result_cls_ops import resolve_training_live_session_id
+        return resolve_training_live_session_id(self._active_live_session_id())
+
+    def _scoped_stem_count(self) -> tuple[int, str]:
+        from studio.result_cls_ops import count_scoped_live_stems
+        scope = self._cls_training_scope()
+        sid = self._live_session_id_for_scope() or ""
+        n = count_scoped_live_stems(sid or None, scope)
+        return n, sid
+
+    def _update_cls_scope_hint(self) -> None:
+        from studio.result_cls_ops import count_scoped_live_stems
+        scope = self._cls_training_scope()
+        n, sid = self._scoped_stem_count()
+        active = self._active_live_session_id()
+        if scope == SCOPE_CURRENT_LIVE:
+            if n == 0:
+                all_n = count_scoped_live_stems(None, SCOPE_ALL_LIVE)
+                self._cls_scope_hint.setText(
+                    f"No crops for session {sid or '(none)'} — "
+                    f"try “All live corrections” ({all_n} live stems on disk)."
+                )
+            elif active and active == sid:
+                self._cls_scope_hint.setText(f"Active live session {sid}: {n} stem(s) with crops.")
+            else:
+                self._cls_scope_hint.setText(
+                    f"Using last saved live session {sid}: {n} stem(s) "
+                    f"(app was restarted — Start live starts a new session)."
+                )
+        elif scope == SCOPE_ALL_LIVE:
+            self._cls_scope_hint.setText(f"All live corrections on disk: {n} stem(s).")
+        else:
+            self._cls_scope_hint.setText(f"Scoped stems with crops: {n}.")
+
+    def _warn_if_scoped_bundle_too_small(self) -> bool:
+        n, sid = self._scoped_stem_count()
+        scope = self._cls_training_scope()
+        if n == 0:
+            QMessageBox.warning(
+                self,
+                "No training images",
+                "No crops match this training scope.\n\n"
+                "After restarting the app, use “Last / current live session” (finds your last saves) "
+                "or “All live corrections”.\n\n"
+                f"Session resolved: {sid or 'none'}",
+            )
+            return False
+        if n >= 6:
+            return True
+        extra = f"\nLive session: {sid}" if scope == SCOPE_CURRENT_LIVE and sid else ""
+        if QMessageBox.warning(
+            self,
+            "Few training images",
+            f"Scoped bundle has only {n} stem(s) (recommend ≥6).{extra}\nBuild anyway?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        ) != QMessageBox.StandardButton.Yes:
+            return False
+        return True
+
+    def _bundle_status_text(self, stats: dict) -> str:
+        scope = stats.get("training_scope", "")
+        sid = stats.get("live_session_id", "")
+        scope_bit = f", scope={scope}"
+        if sid:
+            scope_bit += f", session={sid}"
+        return (
+            f"✅ Bundle: {stats['n_train_total']} train / {stats['n_val_total']} val "
+            f"({stats['n_stems']} stems{scope_bit}, "
+            f"aug {stats['n_aug_train']}+{stats['n_aug_val']})."
+        )
+
     def _build_cls_bundle(self) -> None:
-        from studio.result_cls_ops import build_result_cls_bundle, read_manifest
-        manifest = read_manifest()
-        if len(manifest) < 6:
-            QMessageBox.warning(self, "Not enough data",
-                                "Label at least a few images per class in Data → Results.")
+        if not self._warn_if_scoped_bundle_too_small():
             return
         self._cls_status.setText("Building bundle…")
         self._cls_progress.setRange(0, 0)
+        scope = self._cls_training_scope()
+        live_sid = self._live_session_id_for_scope()
 
         def _worker():
             try:
-                bundle_dir, _n_train, _n_val, stats = build_result_cls_bundle(manifest)
+                from studio.result_cls_ops import build_result_cls_bundle, read_manifest_entries
+                bundle_dir, _n_train, _n_val, stats = build_result_cls_bundle(
+                    entries=read_manifest_entries(),
+                    training_scope=scope,
+                    live_session_id=live_sid,
+                )
                 self._cls_bundle_dir = bundle_dir
                 self._tab_ui_queue.put(("cls_bundle_lbl", f"Bundle: {bundle_dir}"))
-                self._tab_ui_queue.put((
-                    "cls_status",
-                    f"✅ Bundle ready — {stats['n_train_total']} train / {stats['n_val_total']} val "
-                    f"(incl. {stats['n_aug_train']}+{stats['n_aug_val']} aug). Now press Train.",
-                ))
+                self._tab_ui_queue.put(("cls_status", self._bundle_status_text(stats)))
                 self._tab_ui_queue.put(("cls_progress_done",))
             except Exception as e:
                 self._tab_ui_queue.put(("cls_done", False, f"Error: {e}"))
 
         threading.Thread(target=_worker, daemon=True).start()
 
-    def _start_cls_train_only(self) -> None:
-        from studio.result_cls_ops import build_result_cls_bundle, read_manifest, train_resnet34
+    def _build_and_train_cls(self) -> None:
+        if not self._warn_if_scoped_bundle_too_small():
+            return
+        self._start_cls_train_only(auto_build_if_needed=True, force_rebuild=True)
+
+    def _start_cls_train_only(
+        self,
+        auto_build_if_needed: bool = False,
+        force_rebuild: bool = False,
+    ) -> None:
+        from studio.result_cls_ops import build_result_cls_bundle, read_manifest_entries, train_resnet34
         if self._cls_bundle_dir is None:
             QMessageBox.warning(self, "No bundle",
                                 "Build a bundle from manifest or browse to a ready data folder first.")
             return
         bundle_dir = Path(self._cls_bundle_dir).resolve()
         # Auto-build from manifest if the default bundle dir isn't ready yet
-        need_auto_build = False
-        if bundle_dir == RESULT_CLS_BUNDLE_DIR.resolve():
+        need_auto_build = auto_build_if_needed or force_rebuild
+        scope = self._cls_training_scope()
+        live_sid = self._live_session_id_for_scope()
+        if not force_rebuild and bundle_dir == RESULT_CLS_BUNDLE_DIR.resolve():
             err = self._validate_cls_bundle(bundle_dir)
             if err:
-                manifest = read_manifest()
-                if len(manifest) < 6:
-                    QMessageBox.warning(self, "No data",
-                                        "Bundle folder is empty and manifest has < 6 entries.\n"
-                                        "Label images in Data → Results, or browse to a ready folder.")
+                n, _ = self._scoped_stem_count()
+                if n < 1:
+                    QMessageBox.warning(
+                        self,
+                        "No data",
+                        "No crops match the selected training scope.\n"
+                        "Save live corrections on Run or label in Data → Results.",
+                    )
                     return
                 need_auto_build = True
+        elif force_rebuild:
+            n, _ = self._scoped_stem_count()
+            if n < 1:
+                QMessageBox.warning(
+                    self,
+                    "No data",
+                    "No crops match the selected training scope.\n"
+                    "Save live corrections on Run or label in Data → Results.",
+                )
+                return
         else:
             err = self._validate_cls_bundle(bundle_dir)
             if err:
@@ -662,14 +805,14 @@ class TrainTab(QWidget):
             try:
                 actual_bundle = bundle_dir
                 if need_auto_build:
-                    manifest = read_manifest()
-                    actual_bundle, _n_tr, _n_val, stats = build_result_cls_bundle(manifest)
+                    actual_bundle, _n_tr, _n_val, stats = build_result_cls_bundle(
+                        entries=read_manifest_entries(),
+                        training_scope=scope,
+                        live_session_id=live_sid,
+                    )
+                    self._cls_bundle_dir = actual_bundle
                     self._tab_ui_queue.put(("cls_bundle_lbl", f"Bundle: {actual_bundle}"))
-                    self._tab_ui_queue.put((
-                        "cls_status",
-                        f"Training… ({stats['n_train_total']} train / {stats['n_val_total']} val, "
-                        f"incl. {stats['n_aug_train']}+{stats['n_aug_val']} aug)",
-                    ))
+                    self._tab_ui_queue.put(("cls_status", f"Training… {self._bundle_status_text(stats)}"))
 
                 def _progress_cb(epoch, total, train_loss, val_acc):
                     self._tab_ui_queue.put(("cls_progress", epoch, total))

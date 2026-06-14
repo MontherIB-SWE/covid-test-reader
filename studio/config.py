@@ -26,6 +26,14 @@ RESULT_CLS_CROPS_DIR = DATA_RESULT_CLS_DIR / "crops"
 RESULT_CLS_AUGMENTED_DIR = DATA_RESULT_CLS_DIR / "augmented"
 RESULT_CLS_AUGMENT_INDEX = DATA_RESULT_CLS_DIR / "augmented_index.json"
 RESULT_CLS_AUG_PER_STEM = 12
+RESULT_CLS_LIVE_LOG = DATA_RESULT_CLS_DIR / "live_corrections.jsonl"
+RESULT_CLS_LIVE_SESSION_JSON = DATA_RESULT_CLS_DIR / "last_live_session.json"
+
+# Training bundle scope (result classifier)
+SCOPE_CURRENT_LIVE = "current_live_session"
+SCOPE_ALL_LIVE = "all_live"
+SCOPE_FULL = "full"
+SCOPE_LABELED_ONLY = "labeled_only"
 
 # Outputs — build artifacts, configs, training bundles
 OUTPUTS_DIR = Path("outputs")
